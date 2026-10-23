@@ -2693,6 +2693,12 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
             argv,
             capture_output=True,
             text=True,
+            # errors="replace": a transport emitting multibyte UTF-8 must not
+            # raise UnicodeDecodeError during capture — that turns a delivered
+            # message into a reported delivery failure (same bug class as
+            # _run_job_script's strict-decode fix).
+            encoding="utf-8",
+            errors="replace",
             timeout=_get_bot_chat_delivery_timeout(),
             env=env,
             creationflags=windows_hide_flags(),
@@ -4587,13 +4593,27 @@ def _run_job_script(
         from tools.environments.local import build_subprocess_env
 
         popen_kwargs: dict[str, Any] = {"start_new_session": True}
+        # encoding/errors must be set on EVERY platform, not just win32.
+        #
+        # `text=True` alone leaves TextIOWrapper in strict mode, so a script
+        # whose stdout contains multibyte UTF-8 can raise UnicodeDecodeError
+        # during the capture. That error is reported as "Script execution
+        # failed" — i.e. a SUCCESSFUL run is recorded as a failure.
+        #
+        # This is not cosmetic for destructive jobs: a cron wrapper that
+        # retired a 113GB table exited 0 with a valid audit trail, but its
+        # header used '═' / full-width '）', the decode blew up, and the run
+        # was logged as `script failed` with the exception text instead of the
+        # report. An operator reading that would reasonably re-run a job that
+        # had already deleted the data.
+        #
+        # `errors="replace"` keeps every job's real stdout deliverable; a
+        # mangled byte renders as U+FFFD instead of destroying the whole run.
+        popen_kwargs.update({"encoding": "utf-8", "errors": "replace"})
         if sys.platform == "win32":
-            popen_kwargs = {
-                "creationflags": windows_hide_flags()
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-                "encoding": "utf-8",
-                "errors": "replace",
-            }
+            popen_kwargs["creationflags"] = windows_hide_flags() | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+            )
         env = build_subprocess_env()
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,

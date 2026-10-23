@@ -314,6 +314,111 @@ def test_run_job_script_accepts_pathlike_script_path(hermes_env):
 
 
 # ---------------------------------------------------------------------------
+# _run_job_script: script stdout must survive non-ASCII / undecodable bytes
+# ---------------------------------------------------------------------------
+#
+# `text=True` without an explicit `errors=` leaves TextIOWrapper in STRICT mode,
+# so a UnicodeDecodeError raised while capturing stdout surfaced as
+# "Script execution failed: ..." — i.e. a run that exited 0 was recorded as a
+# FAILURE, with the exception text replacing the script's actual report.
+#
+# Observed in production (2026-10-23): a no_agent cron wrapper retired a 113GB
+# table, exited 0, and wrote a valid append-only audit row. Its header line
+# contained box-drawing '═' and a full-width '）', a byte landed mid-sequence at
+# the capture boundary, and the run was logged as
+#
+#     Status: script failed
+#     'utf-8' codec can't decode byte 0xef in position 62: invalid continuation byte
+#
+# An operator reading that would reasonably re-fire a job that had ALREADY
+# deleted the data. `errors="replace"` is not cosmetic here: for destructive
+# jobs the failure/success label is the audit signal.
+#
+# POSIX-only in practice — the win32 branch already set encoding/errors, which
+# is why the bug shipped: the fix is to set them unconditionally.
+
+
+def test_run_job_script_multibyte_stdout_is_delivered(hermes_env):
+    """A script printing CJK / box-drawing / emoji must report ok=True with its
+    text intact. Legal UTF-8 never tripped the strict decoder, which is why this
+    regression stayed hidden — it only asserts the common case still works."""
+    from cron.scheduler import _run_job_script
+
+    script = hermes_env / "scripts" / "retire_report.sh"
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -u\n'
+        'echo "═══ HCTS legacy 表退役 ═══"\n'
+        'echo "✅ 已退役：回收 113GB，留痕已写入 hcts_retention_log"\n'
+        'echo "⏸ 守卫判定：安全"\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    ok, output = _run_job_script(str(script))
+    # Guard containment must not have short-circuited the run — otherwise this
+    # assertion would pass vacuously against the "Blocked" report.
+    assert "Blocked" not in output
+    assert ok is True, output
+    assert "已退役" in output
+    assert "═══" in output
+
+
+def test_run_job_script_undecodable_stdout_does_not_fail_the_run(hermes_env):
+    """The actual regression: bytes that are NOT valid UTF-8 must not turn an
+    exit-0 run into a reported failure.
+
+    0xef followed by 'AB' is not a valid continuation (this is the exact shape
+    of the production error); the second printf emits a sequence truncated
+    mid-codepoint. Both used to raise inside the capture. The contract is:
+    still ok=True, the surviving text still delivered, bad bytes replaced."""
+    from cron.scheduler import _run_job_script
+
+    script = hermes_env / "scripts" / "dirty_bytes.sh"
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -u\n'
+        "printf 'X\\xef\\x41\\x42Y\\n'\n"       # invalid continuation byte
+        "printf 'before\\xe2\\x95after\\n'\n"      # truncated multibyte sequence
+        'echo "still delivered"\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    ok, output = _run_job_script(str(script))
+    assert "Blocked" not in output
+    # The pre-fix behaviour was ok=False with a UnicodeDecodeError string.
+    assert ok is True, output
+    assert "codec can't decode" not in output
+    assert "still delivered" in output
+
+
+def test_run_job_script_replace_does_not_mask_a_real_failure(hermes_env):
+    """Paired with the two above: lenient decoding must NOT become "swallow
+    errors". A non-zero exit still has to report ok=False and keep both streams.
+
+    Without this, the fix could silently turn every failing destructive job
+    into a green one — a far worse outcome than the original bug."""
+    from cron.scheduler import _run_job_script
+
+    script = hermes_env / "scripts" / "failing.sh"
+    script.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo "═══ 标题 ═══"\n'
+        'echo "boom" >&2\n'
+        'exit 7\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    ok, output = _run_job_script(str(script))
+    assert "Blocked" not in output
+    assert ok is False
+    assert "7" in output
+    assert "boom" in output
+
+
+# ---------------------------------------------------------------------------
 # _summarize_cron_failure_for_delivery: mode-aware failure attribution
 # ---------------------------------------------------------------------------
 #

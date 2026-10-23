@@ -590,6 +590,13 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
+                # errors="replace": the agent CLI's stdout/stderr carries the
+                # reply text and may contain multibyte UTF-8 (emoji, CJK, box
+                # drawing). Strict decode raises during capture and turns a
+                # delivered DM into a reported failure — same bug class as
+                # _run_job_script.
+                encoding="utf-8",
+                errors="replace",
             )
             if proc.returncode != 0:
                 from tools.bot_failure_reasons import (
@@ -606,6 +613,8 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                         stdin=subprocess.DEVNULL,
                         capture_output=True,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                     )
             # Re-emit the transport's streams: stdout is the reply text the
             # completion notification carries back to the sending agent.
